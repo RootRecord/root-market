@@ -43,8 +43,24 @@ public final class MarketMenuListener implements Listener {
             return;
         }
 
+        if (holder.mode() == MarketMenuHolder.Mode.CATEGORIES) {
+            if (slot >= holder.keysOrIds().size()) {
+                return;
+            }
+            MarketCategory cat = MarketCategory.fromId(holder.keysOrIds().get(slot));
+            MarketMenus.openCategory(plugin, shops, player, cat);
+            return;
+        }
+
         if (holder.mode() == MarketMenuHolder.Mode.ITEM && slot == MarketMenus.SLOT_BACK) {
-            MarketMenus.openHub(plugin, shops, player);
+            MarketMenus.openCategory(plugin, shops, player, holder.category());
+            return;
+        }
+
+        if (holder.mode() == MarketMenuHolder.Mode.HUB && slot == MarketMenus.SLOT_BACK) {
+            if (plugin.yaml().config().getBoolean("browse.categories", true)) {
+                MarketMenus.openCategories(plugin, shops, player);
+            }
             return;
         }
 
@@ -67,7 +83,20 @@ public final class MarketMenuListener implements Listener {
         String key = keysOrIds.get(slot);
 
         if (holder.mode() == MarketMenuHolder.Mode.HUB) {
-            MarketMenus.openItem(plugin, shops, player, key);
+            MarketMenus.openItem(plugin, shops, player, key, holder.category());
+            return;
+        }
+
+        if (key.startsWith("v:")) {
+            String listingId = key.substring(2);
+            int qty = 1;
+            var listing = shops.virtualListings() != null ? shops.virtualListings().get(listingId) : null;
+            if (listing != null && listing.template() != null) {
+                qty = Math.min(listing.qty(), listing.template().getMaxStackSize());
+            }
+            player.closeInventory();
+            com.rootrecord.minecraft.rootmcshops.virtual.VirtualTradeService.purchase(
+                    shops, shops.economy(), player, listingId, qty);
             return;
         }
 
@@ -75,15 +104,13 @@ public final class MarketMenuListener implements Listener {
         if (shop == null) {
             return;
         }
-        String owner = shop.ownerName() != null ? shop.ownerName() : "Seller";
-        player.sendMessage(plugin.msg("coords")
-                .replace("{player}", owner)
-                .replace("{item}", shop.itemKey() != null ? shop.itemKey().toLowerCase(Locale.ROOT) : "?")
-                .replace("{world}", shop.world())
-                .replace("{x}", String.valueOf(shop.x()))
-                .replace("{y}", String.valueOf(shop.y()))
-                .replace("{z}", String.valueOf(shop.z()))
-                .replace("{price}", String.format(Locale.US, "%.3f", shop.price())));
+        if (!shop.isSellShop()) {
+            return;
+        }
+        int qty = Math.max(1, shop.saleQty());
+        player.closeInventory();
+        com.rootrecord.minecraft.rootmcshops.ShopBuyService.executePurchase(
+                player, shops, shops.economy(), shop, qty);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -95,24 +122,27 @@ public final class MarketMenuListener implements Listener {
 
     private void reopen(Player player, RootMcShopsPlugin shops, MarketMenuHolder holder, int page) {
         switch (holder.mode()) {
+            case CATEGORIES -> MarketMenus.openCategories(plugin, shops, player);
             case HUB -> {
-                List<MarketMenus.HubRow> rows = MarketMenus.buildHubRows(shops);
+                List<MarketMenus.HubRow> rows = MarketMenus.buildHubRows(shops, holder.category(), plugin);
                 if (rows.isEmpty()) {
                     player.closeInventory();
                     player.sendMessage(plugin.msg("hub-empty"));
                     return;
                 }
-                MarketMenus.openHubPage(plugin, shops, player, rows, page);
+                MarketMenus.openHubPage(plugin, shops, player, rows, page, holder.category());
             }
             case ITEM -> {
-                List<ShopListing> listings = MarketMenus.listingsForItem(shops, holder.itemKey());
-                if (listings.isEmpty()) {
+                List<MarketMenus.MixedOffer> offers =
+                        MarketMenus.mixedOffersForItem(plugin, shops, holder.itemKey());
+                if (offers.isEmpty()) {
                     player.closeInventory();
                     player.sendMessage(plugin.msg("item-empty")
                             .replace("{item}", holder.itemKey().toLowerCase(Locale.ROOT)));
                     return;
                 }
-                MarketMenus.openItemPage(plugin, shops, player, holder.itemKey(), listings, page);
+                MarketMenus.openItemPage(
+                        plugin, shops, player, holder.itemKey(), offers, page, holder.category());
             }
             case PLAYER -> {
                 MarketMenus.OwnerMatch match =

@@ -16,10 +16,8 @@ import org.bukkit.inventory.meta.ItemMeta;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.UUID;
 
 public final class MarketMenus {
@@ -33,12 +31,50 @@ public final class MarketMenus {
     private MarketMenus() {}
 
     public static void openHub(RootMarketPlugin plugin, RootMcShopsPlugin shops, Player viewer) {
-        List<HubRow> rows = buildHubRows(shops);
-        if (rows.isEmpty()) {
+        if (plugin.yaml().config().getBoolean("browse.categories", true)) {
+            openCategories(plugin, shops, viewer);
+            return;
+        }
+        openCategory(plugin, shops, viewer, MarketCategory.ALL);
+    }
+
+    public static void openCategories(RootMarketPlugin plugin, RootMcShopsPlugin shops, Player viewer) {
+        MarketQuotes.Index quotes = MarketQuotes.build(shops);
+        if (quotes.all().isEmpty()) {
             viewer.sendMessage(plugin.msg("hub-empty"));
             return;
         }
-        openHubPage(plugin, shops, viewer, rows, 0);
+        List<String> ids = new ArrayList<>();
+        for (MarketCategory cat : MarketCategory.values()) {
+            ids.add(cat.id());
+        }
+        MarketMenuHolder holder = MarketMenuHolder.categories(viewer.getUniqueId(), ids);
+        Inventory inv = Bukkit.createInventory(
+                holder, 27, Component.text(strip(plugin.rawMsg("categories-title")), NamedTextColor.DARK_GREEN));
+        holder.bind(inv);
+
+        int slot = 0;
+        for (MarketCategory cat : MarketCategory.values()) {
+            int count = 0;
+            for (String key : quotes.all().keySet()) {
+                if (cat.matches(key)) {
+                    count++;
+                }
+            }
+            inv.setItem(slot++, categoryItem(plugin, cat, count));
+        }
+        inv.setItem(22, trendingInfo(plugin, shops, quotes.all().size(), 0, 1));
+        viewer.openInventory(inv);
+    }
+
+    public static void openCategory(
+            RootMarketPlugin plugin, RootMcShopsPlugin shops, Player viewer, MarketCategory category) {
+        List<HubRow> rows = buildHubRows(shops, category, plugin);
+        if (rows.isEmpty()) {
+            viewer.sendMessage(plugin.msg("category-empty").replace("{category}", category.display()));
+            return;
+        }
+        openHubPage(plugin, shops, viewer, rows, 0, category);
     }
 
     public static void openHubPage(
@@ -47,6 +83,16 @@ public final class MarketMenus {
             Player viewer,
             List<HubRow> rows,
             int page) {
+        openHubPage(plugin, shops, viewer, rows, page, MarketCategory.ALL);
+    }
+
+    public static void openHubPage(
+            RootMarketPlugin plugin,
+            RootMcShopsPlugin shops,
+            Player viewer,
+            List<HubRow> rows,
+            int page,
+            MarketCategory category) {
         int totalPages = Math.max(1, (int) Math.ceil(rows.size() / (double) PAGE_SIZE));
         int safePage = Math.min(Math.max(0, page), totalPages - 1);
         int from = safePage * PAGE_SIZE;
@@ -55,24 +101,24 @@ public final class MarketMenus {
         List<String> keys = pageRows.stream().map(HubRow::itemKey).toList();
 
         String titleRaw = plugin.rawMsg("hub-title")
+                .replace("{category}", category.display())
                 .replace("{page}", String.valueOf(safePage + 1))
                 .replace("{pages}", String.valueOf(totalPages));
-        MarketMenuHolder holder = MarketMenuHolder.hub(viewer.getUniqueId(), safePage, keys);
+        MarketMenuHolder holder = MarketMenuHolder.hub(viewer.getUniqueId(), safePage, keys, category.id());
         Inventory inv = Bukkit.createInventory(holder, 54, Component.text(strip(titleRaw), NamedTextColor.DARK_GREEN));
         holder.bind(inv);
 
+        MarketQuotes.Index quotes = MarketQuotes.build(shops);
         for (int i = 0; i < pageRows.size(); i++) {
-            inv.setItem(i, hubItem(pageRows.get(i)));
+            inv.setItem(i, hubItem(pageRows.get(i), quotes.get(pageRows.get(i).itemKey())));
         }
         if (safePage > 0) {
             inv.setItem(SLOT_PREV, nav(Material.ARROW, plugin.rawMsg("hub-prev")));
         }
-        inv.setItem(SLOT_INFO, infoBook(
-                strip(plugin.rawMsg("hub-info")),
-                List.of(
-                        rows.size() + " item type(s) listed",
-                        "Page " + (safePage + 1) + " / " + totalPages,
-                        strip(plugin.rawMsg("hub-hint")))));
+        if (plugin.yaml().config().getBoolean("browse.categories", true)) {
+            inv.setItem(SLOT_BACK, nav(Material.BARRIER, plugin.rawMsg("hub-back-categories")));
+        }
+        inv.setItem(SLOT_INFO, trendingInfo(plugin, shops, rows.size(), safePage, totalPages));
         if (safePage < totalPages - 1) {
             inv.setItem(SLOT_NEXT, nav(Material.ARROW, plugin.rawMsg("hub-next")));
         }
@@ -80,12 +126,21 @@ public final class MarketMenus {
     }
 
     public static void openItem(RootMarketPlugin plugin, RootMcShopsPlugin shops, Player viewer, String itemKey) {
-        List<ShopListing> listings = listingsForItem(shops, itemKey);
-        if (listings.isEmpty()) {
+        openItem(plugin, shops, viewer, itemKey, MarketCategory.ALL);
+    }
+
+    public static void openItem(
+            RootMarketPlugin plugin,
+            RootMcShopsPlugin shops,
+            Player viewer,
+            String itemKey,
+            MarketCategory category) {
+        List<MixedOffer> offers = mixedOffersForItem(plugin, shops, itemKey);
+        if (offers.isEmpty()) {
             viewer.sendMessage(plugin.msg("item-empty").replace("{item}", itemKey.toLowerCase(Locale.ROOT)));
             return;
         }
-        openItemPage(plugin, shops, viewer, itemKey, listings, 0);
+        openItemPage(plugin, shops, viewer, itemKey, offers, 0, category);
     }
 
     public static void openItemPage(
@@ -93,43 +148,64 @@ public final class MarketMenus {
             RootMcShopsPlugin shops,
             Player viewer,
             String itemKey,
-            List<ShopListing> listings,
-            int page) {
-        int totalPages = Math.max(1, (int) Math.ceil(listings.size() / (double) PAGE_SIZE));
+            List<MixedOffer> offers,
+            int page,
+            MarketCategory category) {
+        int totalPages = Math.max(1, (int) Math.ceil(offers.size() / (double) PAGE_SIZE));
         int safePage = Math.min(Math.max(0, page), totalPages - 1);
         int from = safePage * PAGE_SIZE;
-        int to = Math.min(from + PAGE_SIZE, listings.size());
-        List<ShopListing> pageList = listings.subList(from, to);
-        List<String> ids = pageList.stream().map(ShopListing::id).toList();
+        int to = Math.min(from + PAGE_SIZE, offers.size());
+        List<MixedOffer> pageList = offers.subList(from, to);
+        List<String> ids = pageList.stream().map(MixedOffer::id).toList();
 
-        double cheapest = listings.stream().mapToDouble(ShopListing::price).min().orElse(0);
+        double cheapest = offers.stream().mapToDouble(MixedOffer::price).min().orElse(0);
         String titleRaw = plugin.rawMsg("item-title")
                 .replace("{item}", pretty(itemKey))
                 .replace("{page}", String.valueOf(safePage + 1))
                 .replace("{pages}", String.valueOf(totalPages));
-        MarketMenuHolder holder = MarketMenuHolder.item(viewer.getUniqueId(), itemKey, safePage, ids);
+        MarketMenuHolder holder =
+                MarketMenuHolder.item(viewer.getUniqueId(), itemKey, safePage, ids, category.id());
         Inventory inv = Bukkit.createInventory(holder, 54, Component.text(strip(titleRaw), NamedTextColor.DARK_GREEN));
         holder.bind(inv);
 
         for (int i = 0; i < pageList.size(); i++) {
-            inv.setItem(i, listingItem(shops, pageList.get(i), true));
+            MixedOffer offer = pageList.get(i);
+            if (offer.virtual()) {
+                inv.setItem(i, virtualListingItem(offer));
+            } else {
+                ShopListing shop = shops.store().getById(offer.id());
+                if (shop != null) {
+                    inv.setItem(i, listingItem(shops, shop, true));
+                }
+            }
         }
         if (safePage > 0) {
             inv.setItem(SLOT_PREV, nav(Material.ARROW, plugin.rawMsg("item-prev")));
         }
         inv.setItem(SLOT_BACK, nav(Material.BARRIER, plugin.rawMsg("item-back")));
-        inv.setItem(SLOT_INFO, infoBook(
-                pretty(itemKey),
-                List.of(
-                        strip(plugin.rawMsg("item-info")
-                                .replace("{count}", String.valueOf(listings.size()))
-                                .replace("{price}", String.format(Locale.US, "%.3f", cheapest))),
-                        "Page " + (safePage + 1) + " / " + totalPages,
-                        strip(plugin.rawMsg("item-hint").replace("{item}", itemKey.toLowerCase(Locale.ROOT))))));
+        MarketQuotes.Quote quote = MarketQuotes.build(shops).get(itemKey);
+        inv.setItem(SLOT_INFO, itemQuoteBook(plugin, itemKey, offers.size(), cheapest, quote, safePage, totalPages));
         if (safePage < totalPages - 1) {
             inv.setItem(SLOT_NEXT, nav(Material.ARROW, plugin.rawMsg("item-next")));
         }
         viewer.openInventory(inv);
+    }
+
+    public static List<MixedOffer> mixedOffersForItem(
+            RootMarketPlugin plugin, RootMcShopsPlugin shops, String itemKey) {
+        List<MixedOffer> out = new ArrayList<>();
+        for (ShopListing shop : listingsForItem(shops, itemKey)) {
+            out.add(new MixedOffer(shop.id(), false, shop.price(), shop.ownerName(), shops.countStock(shop), null));
+        }
+        boolean includeVirtual = plugin.yaml().config().getBoolean("browse.include-virtual", true);
+        var vstore = shops.virtualListings();
+        if (includeVirtual && vstore != null && vstore.enabled()) {
+            for (var v : vstore.sellForItem(itemKey)) {
+                out.add(new MixedOffer("v:" + v.id(), true, v.price(), v.ownerName(), v.qty(), v));
+            }
+        }
+        out.sort(Comparator.comparingDouble(MixedOffer::price).thenComparing(MixedOffer::id));
+        return out;
     }
 
     public static void openPlayer(RootMarketPlugin plugin, RootMcShopsPlugin shops, Player viewer, String ownerQuery) {
@@ -188,26 +264,29 @@ public final class MarketMenus {
     }
 
     public static List<HubRow> buildHubRows(RootMcShopsPlugin shops) {
-        Map<String, HubRow> map = new HashMap<>();
-        for (ShopListing shop : shops.store().all()) {
-            if (!shop.isSellShop() || shop.itemKey() == null || shop.itemKey().isBlank()) {
+        return buildHubRows(shops, MarketCategory.ALL, null);
+    }
+
+    public static List<HubRow> buildHubRows(
+            RootMcShopsPlugin shops, MarketCategory category, RootMarketPlugin plugin) {
+        boolean showBuyOnly = plugin == null
+                || plugin.yaml().config().getBoolean("browse.show-buy-only-items", true);
+        MarketQuotes.Index quotes = MarketQuotes.build(shops);
+        List<HubRow> rows = new ArrayList<>();
+        for (MarketQuotes.Quote q : quotes.all().values()) {
+            if (!category.matches(q.itemKey())) {
                 continue;
             }
-            String key = shop.itemKey().toUpperCase(Locale.ROOT);
-            int stock = shops.countStock(shop);
-            HubRow row = map.get(key);
-            if (row == null) {
-                map.put(key, new HubRow(key, shop.price(), stock, 1, stock > 0 ? 1 : 0));
-            } else {
-                map.put(key, new HubRow(
-                        key,
-                        Math.min(row.cheapestPrice(), shop.price()),
-                        row.totalStock() + stock,
-                        row.sellerCount() + 1,
-                        row.inStockCount() + (stock > 0 ? 1 : 0)));
+            if (!q.hasBuy() && !(showBuyOnly && q.hasSell())) {
+                continue;
             }
+            rows.add(new HubRow(
+                    q.itemKey(),
+                    q.hasBuy() ? q.buyUnit() : (q.hasSell() ? q.sellUnit() : 0),
+                    q.buyStock(),
+                    q.buyShops(),
+                    q.hasBuy() ? q.buyShops() : 0));
         }
-        List<HubRow> rows = new ArrayList<>(map.values());
         rows.sort(Comparator
                 .comparingInt(HubRow::inStockCount).reversed()
                 .thenComparing(HubRow::itemKey, String.CASE_INSENSITIVE_ORDER));
@@ -291,7 +370,23 @@ public final class MarketMenus {
         return null;
     }
 
-    private static ItemStack hubItem(HubRow row) {
+    private static ItemStack categoryItem(RootMarketPlugin plugin, MarketCategory cat, int count) {
+        ItemStack stack = new ItemStack(cat.icon(), 1);
+        ItemMeta meta = stack.getItemMeta();
+        if (meta != null) {
+            meta.displayName(Component.text(cat.display(), NamedTextColor.GOLD)
+                    .decoration(TextDecoration.ITALIC, false));
+            meta.lore(List.of(
+                    Component.text(count + " item type(s) with live shops", NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, false),
+                    Component.text(strip(plugin.rawMsg("category-hint")), NamedTextColor.AQUA)
+                            .decoration(TextDecoration.ITALIC, false)));
+            stack.setItemMeta(meta);
+        }
+        return stack;
+    }
+
+    private static ItemStack hubItem(HubRow row, MarketQuotes.Quote quote) {
         ItemStack stack = ShopItemKeys.stackForKey(row.itemKey());
         if (stack == null) {
             Material mat = ShopItemKeys.baseMaterial(row.itemKey());
@@ -302,20 +397,110 @@ public final class MarketMenus {
         }
         ItemMeta meta = stack.getItemMeta();
         if (meta != null) {
-            meta.displayName(Component.text(pretty(row.itemKey()), NamedTextColor.GOLD)
+            meta.displayName(Component.text(pretty(row.itemKey()), NamedTextColor.WHITE)
                     .decoration(TextDecoration.ITALIC, false));
             List<Component> lore = new ArrayList<>();
-            lore.add(Component.text(
-                            String.format(Locale.US, "From %.3f G · %d seller(s)", row.cheapestPrice(), row.sellerCount()),
-                            NamedTextColor.YELLOW)
+            lore.add(Component.text("Click to shop.", NamedTextColor.AQUA)
                     .decoration(TextDecoration.ITALIC, false));
-            lore.add(Component.text(
-                            "In stock: " + row.inStockCount() + " shop(s) · " + row.totalStock() + " items",
-                            row.inStockCount() > 0 ? NamedTextColor.GREEN : NamedTextColor.RED)
-                    .decoration(TextDecoration.ITALIC, false));
-            lore.add(Component.text("Click to see sellers", NamedTextColor.DARK_GRAY)
-                    .decoration(TextDecoration.ITALIC, false));
+            lore.add(Component.empty());
+            lore.add(Component.text("BUY", NamedTextColor.RED)
+                    .decoration(TextDecoration.ITALIC, false)
+                    .decorate(TextDecoration.BOLD));
+            if (quote != null && quote.hasBuy()) {
+                lore.add(Component.text(MarketQuotes.formatUnitG(quote.buyUnit()), NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+                lore.add(Component.text(MarketQuotes.formatStackG(quote.buyStack()), NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+            } else {
+                lore.add(Component.text("No sell shops in stock", NamedTextColor.DARK_GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+            }
+            lore.add(Component.empty());
+            lore.add(Component.text("SELL", NamedTextColor.GREEN)
+                    .decoration(TextDecoration.ITALIC, false)
+                    .decorate(TextDecoration.BOLD));
+            if (quote != null && quote.hasSell()) {
+                lore.add(Component.text(MarketQuotes.formatUnitG(quote.sellUnit()), NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+                lore.add(Component.text(MarketQuotes.formatStackG(quote.sellStack()), NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+            } else {
+                lore.add(Component.text("No buy shops with capacity", NamedTextColor.DARK_GRAY)
+                        .decoration(TextDecoration.ITALIC, false));
+            }
+            if (quote != null && quote.sellMultiPct() != null) {
+                lore.add(Component.empty());
+                NamedTextColor dyn = quote.sellMultiPct() >= 0 ? NamedTextColor.GREEN : NamedTextColor.LIGHT_PURPLE;
+                lore.add(Component.text(MarketQuotes.formatDynamicSell(quote.sellMultiPct()), dyn)
+                        .decoration(TextDecoration.ITALIC, false));
+            }
             meta.lore(lore);
+            stack.setItemMeta(meta);
+        }
+        return stack;
+    }
+
+    private static ItemStack itemQuoteBook(
+            RootMarketPlugin plugin,
+            String itemKey,
+            int listingCount,
+            double cheapest,
+            MarketQuotes.Quote quote,
+            int page,
+            int totalPages) {
+        ItemStack stack = new ItemStack(Material.BOOK, 1);
+        ItemMeta meta = stack.getItemMeta();
+        if (meta == null) {
+            return stack;
+        }
+        meta.displayName(Component.text(pretty(itemKey), NamedTextColor.GREEN)
+                .decoration(TextDecoration.ITALIC, false));
+        List<Component> lore = new ArrayList<>();
+        lore.add(Component.text(
+                        strip(plugin.rawMsg("item-info")
+                                .replace("{count}", String.valueOf(listingCount))
+                                .replace("{price}", String.format(Locale.US, "%.3f", cheapest))),
+                        NamedTextColor.GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        if (quote != null && quote.hasSell()) {
+            lore.add(Component.text(
+                            "Best /sell: " + MarketQuotes.formatUnitG(quote.sellUnit()),
+                            NamedTextColor.GREEN)
+                    .decoration(TextDecoration.ITALIC, false));
+            if (quote.sellMultiPct() != null) {
+                lore.add(Component.text(MarketQuotes.formatDynamicSell(quote.sellMultiPct()), NamedTextColor.LIGHT_PURPLE)
+                        .decoration(TextDecoration.ITALIC, false));
+            }
+        }
+        lore.add(Component.text("Page " + (page + 1) + " / " + totalPages, NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        lore.add(Component.text(
+                        strip(plugin.rawMsg("item-hint").replace("{item}", itemKey.toLowerCase(Locale.ROOT))),
+                        NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(lore);
+        stack.setItemMeta(meta);
+        return stack;
+    }
+
+    private static ItemStack virtualListingItem(MixedOffer offer) {
+        ItemStack stack = null;
+        if (offer.virtualListing() != null) {
+            stack = offer.virtualListing().stackSample();
+        }
+        if (stack == null) {
+            stack = new ItemStack(Material.ENDER_CHEST, 1);
+        }
+        ItemMeta meta = stack.getItemMeta();
+        if (meta != null) {
+            String seller = offer.ownerName() != null ? offer.ownerName() : "Seller";
+            meta.displayName(Component.text(seller + " (virtual)", NamedTextColor.LIGHT_PURPLE)
+                    .decoration(TextDecoration.ITALIC, false));
+            meta.lore(List.of(
+                    Component.text(String.format(Locale.US, "%.3f G ea · qty %d", offer.price(), offer.qty()), NamedTextColor.YELLOW)
+                            .decoration(TextDecoration.ITALIC, false),
+                    Component.text("Click to buy into My Storage (/item)", NamedTextColor.AQUA)
+                            .decoration(TextDecoration.ITALIC, false)));
             stack.setItemMeta(meta);
         }
         return stack;
@@ -356,11 +541,7 @@ public final class MarketMenus {
                     .decoration(TextDecoration.ITALIC, false));
             lore.add(Component.text("Stock: " + stock, stock > 0 ? NamedTextColor.GREEN : NamedTextColor.RED)
                     .decoration(TextDecoration.ITALIC, false));
-            lore.add(Component.text(
-                            shop.world() + " " + shop.x() + ", " + shop.y() + ", " + shop.z(),
-                            NamedTextColor.GRAY)
-                    .decoration(TextDecoration.ITALIC, false));
-            lore.add(Component.text("Click for coords in chat", NamedTextColor.DARK_GRAY)
+            lore.add(Component.text("Click to buy", NamedTextColor.AQUA)
                     .decoration(TextDecoration.ITALIC, false));
             meta.lore(lore);
             stack.setItemMeta(meta);
@@ -377,6 +558,107 @@ public final class MarketMenus {
             stack.setItemMeta(meta);
         }
         return stack;
+    }
+
+    private static ItemStack trendingInfo(
+            RootMarketPlugin plugin,
+            RootMcShopsPlugin shops,
+            int listedTypes,
+            int page,
+            int totalPages) {
+        boolean enabled = plugin.yaml().config().getBoolean("trending.enabled", true);
+        if (!enabled) {
+            return infoBook(
+                    strip(plugin.rawMsg("hub-info")),
+                    List.of(
+                            listedTypes + " item type(s) listed",
+                            "Page " + (page + 1) + " / " + totalPages,
+                            strip(plugin.rawMsg("hub-hint"))));
+        }
+
+        MarketTrending.Snapshot snap = MarketTrending.compute(plugin, shops);
+        ItemStack stack = new ItemStack(Material.SPYGLASS, 1);
+        ItemMeta meta = stack.getItemMeta();
+        if (meta == null) {
+            return stack;
+        }
+        meta.displayName(Component.text(strip(plugin.rawMsg("trending-title")), NamedTextColor.LIGHT_PURPLE)
+                .decoration(TextDecoration.ITALIC, false));
+        List<Component> lore = new ArrayList<>();
+
+        String mode = plugin.yaml().config().getString("trending.mode", "sell").trim().toLowerCase(Locale.ROOT);
+        boolean showSell = !"buy".equals(mode);
+        boolean showBuy = "buy".equals(mode) || "both".equals(mode);
+
+        if (showSell) {
+            appendTrendingSection(
+                    lore,
+                    strip(plugin.rawMsg("trending-sell-high")),
+                    snap.highestSell(),
+                    true);
+            appendTrendingSection(
+                    lore,
+                    strip(plugin.rawMsg("trending-sell-low")),
+                    snap.lowestSell(),
+                    false);
+        }
+        if (showBuy) {
+            appendTrendingSection(
+                    lore,
+                    strip(plugin.rawMsg("trending-buy-high")),
+                    snap.highestBuy(),
+                    true);
+            appendTrendingSection(
+                    lore,
+                    strip(plugin.rawMsg("trending-buy-low")),
+                    snap.lowestBuy(),
+                    false);
+        }
+
+        if (lore.isEmpty()) {
+            lore.add(Component.text(strip(plugin.rawMsg("trending-empty")), NamedTextColor.GRAY)
+                    .decoration(TextDecoration.ITALIC, false));
+        }
+        lore.add(Component.empty());
+        lore.add(Component.text(
+                        listedTypes + " listed · page " + (page + 1) + "/" + totalPages,
+                        NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        lore.add(Component.text(strip(plugin.rawMsg("hub-hint")), NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(lore);
+        stack.setItemMeta(meta);
+        return stack;
+    }
+
+    private static void appendTrendingSection(
+            List<Component> lore,
+            String header,
+            List<MarketTrending.Entry> entries,
+            boolean high) {
+        if (entries == null || entries.isEmpty()) {
+            return;
+        }
+        if (!lore.isEmpty()) {
+            lore.add(Component.empty());
+        }
+        NamedTextColor headerColor = high ? NamedTextColor.GREEN : NamedTextColor.RED;
+        lore.add(Component.text(header, headerColor).decoration(TextDecoration.ITALIC, false));
+        int rank = 1;
+        for (MarketTrending.Entry e : entries) {
+            NamedTextColor pctColor = e.multiPct() >= 0 ? NamedTextColor.GREEN : NamedTextColor.RED;
+            lore.add(Component.text("#" + rank + " ", NamedTextColor.GRAY)
+                    .decoration(TextDecoration.ITALIC, false)
+                    .append(Component.text(pretty(e.itemKey()), NamedTextColor.WHITE)
+                            .decoration(TextDecoration.ITALIC, false))
+                    .append(Component.text(" " + MarketTrending.formatPct(e.multiPct()), pctColor)
+                            .decoration(TextDecoration.ITALIC, false))
+                    .append(Component.text(
+                                    " (" + MarketTrending.formatStackG(e.stackPrice()) + ")",
+                                    NamedTextColor.DARK_GRAY)
+                            .decoration(TextDecoration.ITALIC, false)));
+            rank++;
+        }
     }
 
     private static ItemStack infoBook(String title, List<String> loreLines) {
@@ -423,4 +705,12 @@ public final class MarketMenus {
     public record HubRow(String itemKey, double cheapestPrice, int totalStock, int sellerCount, int inStockCount) {}
 
     public record OwnerMatch(String ownerUuid, String ownerName) {}
+
+    public record MixedOffer(
+            String id,
+            boolean virtual,
+            double price,
+            String ownerName,
+            int qty,
+            com.rootrecord.minecraft.rootmcshops.virtual.VirtualListing virtualListing) {}
 }

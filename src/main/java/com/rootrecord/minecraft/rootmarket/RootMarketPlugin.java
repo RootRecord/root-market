@@ -2,7 +2,6 @@ package com.rootrecord.minecraft.rootmarket;
 
 import com.rootrecord.minecraft.common.RootRecordFolders;
 import com.rootrecord.minecraft.common.config.RootRecordYamlConfig;
-import com.rootrecord.minecraft.rootmcshops.RootMcShopsPlugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class RootMarketPlugin extends JavaPlugin {
@@ -11,7 +10,8 @@ public final class RootMarketPlugin extends JavaPlugin {
 
     @Override
     public void onEnable() {
-        if (RootMcShopsPlugin.get() == null) {
+        var chestShops = getServer().getPluginManager().getPlugin("Root-ChestShops");
+        if (chestShops == null || !chestShops.isEnabled()) {
             getLogger().severe("Root-ChestShops is not enabled — disabling Root-Market.");
             getServer().getPluginManager().disablePlugin(this);
             return;
@@ -32,6 +32,10 @@ public final class RootMarketPlugin extends JavaPlugin {
         }
         getServer().getPluginManager().registerEvents(new MarketMenuListener(this), this);
         getLogger().info("Root-Market enabled — /market /items /shops");
+    }
+
+    public RootRecordYamlConfig yaml() {
+        return yaml;
     }
 
     public String rawMsg(String key) {
